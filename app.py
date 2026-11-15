@@ -491,7 +491,7 @@ def generate_video_essay(
     return final_mp4, summary
 
 
-with gr.Blocks(theme=gr.themes.Base(primary_hue="amber", neutral_hue="slate"), title="KINETIC ESSAY STUDIO") as demo:
+with gr.Blocks(title="KINETIC ESSAY STUDIO") as demo:
     gr.Markdown("# 🎬 KINETIC ESSAY STUDIO\n**محرك إنتاج المقالات المرئية الحديثة (Kinetic Typography + Real Photographic Evidence + Cinematic SFX)**")
 
     with gr.Row():
@@ -525,9 +525,8 @@ with gr.Blocks(theme=gr.themes.Base(primary_hue="amber", neutral_hue="slate"), t
     run_btn.click(
         fn=generate_video_essay,
         inputs=[script_box, api_key_box, voice_dropdown, speed_slider, mode_radio, sfx_checkbox],
-        outputs=[video_out, status_out],
-        api_name=False
+        outputs=[video_out, status_out]
     )
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0", server_port=7860, share=True, show_api=False)
+    demo.queue().launch(server_name="0.0.0.0", server_port=7860, share=True)
