@@ -3,13 +3,14 @@ import re
 import uuid
 import json
 import random
+import threading
 import logging
 import subprocess
 from typing import Dict, Any, List, Tuple, Optional
 
 import numpy as np
 import soundfile as sf
-import gradio as gr
+from flask import Flask, request, jsonify, send_file, render_template_string
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from director import KineticDirector
@@ -18,14 +19,11 @@ from media_fetcher import KineticMediaFetcher
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("kinetic.app")
 
+app = Flask(__name__)
+JOBS: Dict[str, Dict[str, Any]] = {}
+
 
 class AudioAndSFXEngine:
-    """
-    محرك الصوت المتكامل:
-    - يولّد التعليق الصوتي لكل مشهد (Kokoro TTS) ويستخرج التوقيت الدقيق لكل كلمة (WhisperX).
-    - يدمج خلفية موسيقية هادية (Dark Ambient Drone) + مؤثرات صوتية سينمائية (Sub-Bass Boom & Whoosh)
-      عند انتقال المشاهد وظهور الأرقام والوثائق.
-    """
     def __init__(self, work_dir: str, voice: str = "am_michael", speed: float = 1.0):
         self.work_dir = work_dir
         self.audio_dir = os.path.join(work_dir, "audio_segments")
@@ -118,7 +116,6 @@ class AudioAndSFXEngine:
 
         self._align_whisperx(voice_wav, scenes)
 
-        # Mix subtle dark ambient bed + cinematic transition SFX (Sub-Bass Boom & Soft Whoosh)
         master_audio = voice_only.copy()
         if enable_sfx and len(master_audio) > 0:
             t = np.arange(len(master_audio), dtype=np.float32) / float(self.sample_rate)
@@ -157,12 +154,6 @@ class AudioAndSFXEngine:
 
 
 class KineticRenderer:
-    """
-    محرك الريندر البصري (MagnatesMedia / Moon Style):
-    - خلفية داكنة أنيقة بنسيج شبكي خفيف.
-    - نصوص حركية ضخمة تتلون كلمة بكلمة مع الصوت وتبرز الكلمات المفتاحية بالذهبي.
-    - صور حقيقية بإطارات عصرية وحركة زووم ناعمة + إحصائيات عملاقة + بطاقات أدلة.
-    """
     def __init__(self, work_dir: str, width: int = 1920, height: int = 1080, fps: int = 30):
         self.work_dir = work_dir
         self.renders_dir = os.path.join(work_dir, "scene_renders")
@@ -431,7 +422,7 @@ class KineticRenderer:
         proc.wait()
         return out_clip
 
-    def build_movie(self, timeline: Dict[str, Any], audio_wav: str, out_mp4: str, preview_sec: Optional[float] = None) -> str:
+    def build_movie(self, timeline: Dict[str, Any], audio_wav: str, out_mp4: str, preview_sec: Optional[float] = None, job_id: str = "") -> str:
         scenes = timeline.get("scenes") or []
         if preview_sec and preview_sec > 0:
             sub, acc = [], 0.0
@@ -444,7 +435,8 @@ class KineticRenderer:
 
         clips = []
         for idx, s in enumerate(scenes, start=1):
-            logger.info("Rendering scene %d/%d (%s)...", idx, len(scenes), s.get("template_type"))
+            if job_id in JOBS:
+                JOBS[job_id]["status"] = f"4/4: جاري ريندر المشهد {idx} من {len(scenes)} ({s.get('template_type')})..."
             clips.append(self.render_scene(s))
 
         concat_txt = os.path.join(self.work_dir, "concat.txt")
@@ -459,89 +451,169 @@ class KineticRenderer:
         return out_mp4
 
 
-def generate_video_essay(
-    script_text: str,
-    deepseek_api_key: str,
-    voice_name: str,
-    speech_speed: float,
-    render_mode: str,
-    enable_sfx: bool,
-    progress=gr.Progress()
-):
-    if not (script_text or "").strip():
-        raise gr.Error("يرجى إدخال السكريبت الإنجليزي أولاً.")
-    if not (deepseek_api_key or "").strip():
-        raise gr.Error("يرجى إدخال مفتاح DeepSeek API Key.")
+def _run_job(job_id: str, params: Dict[str, Any]):
+    try:
+        job_dir = os.path.join("./workspace/jobs", job_id)
+        os.makedirs(job_dir, exist_ok=True)
+
+        JOBS[job_id]["status"] = "1/4: تقطيع السكريبت وإخراج المشاهد (DeepSeek-V4.1-Flash)..."
+        director = KineticDirector(api_key=params["api_key"], model_id="DeepSeek-V4.1-Flash")
+        timeline = director.process_full_script(params["script"], job_id=job_id)
+
+        JOBS[job_id]["status"] = f"2/4: توليد التعليق الصوتي والمؤثرات ({len(timeline['scenes'])} مشهد)..."
+        audio_engine = AudioAndSFXEngine(work_dir=job_dir, voice=params["voice"], speed=params["speed"])
+        master_wav = audio_engine.generate_and_master(timeline, enable_sfx=params["enable_sfx"])
+
+        JOBS[job_id]["status"] = "3/4: جلب الصور الحقيقية المطابقة للمشاهد..."
+        fetcher = KineticMediaFetcher(work_dir=job_dir)
+        timeline = fetcher.populate_timeline_media(timeline)
+
+        is_preview = params["mode"] == "preview"
+        width, height = (1280, 720) if is_preview else (1920, 1080)
+        preview_sec = 25.0 if is_preview else None
+
+        renderer = KineticRenderer(work_dir=job_dir, width=width, height=height, fps=30)
+        final_mp4 = os.path.join(job_dir, f"kinetic_essay_{job_id}.mp4")
+        renderer.build_movie(timeline, audio_wav=master_wav, out_mp4=final_mp4, preview_sec=preview_sec, job_id=job_id)
+
+        JOBS[job_id]["done"] = True
+        JOBS[job_id]["video_path"] = final_mp4
+        JOBS[job_id]["status"] = f"✅ تم الإنتاج بنجاح ({len(timeline['scenes'])} مشهد)!"
+    except Exception as e:
+        logger.exception("Job failed")
+        JOBS[job_id]["error"] = str(e)
+        JOBS[job_id]["status"] = f"❌ خطأ: {e}"
+
+
+HTML_UI = """
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<title>KINETIC ESSAY STUDIO</title>
+<style>
+  body { background:#0c0d11; color:#f8f9fa; font-family:system-ui,-apple-system,sans-serif; margin:0; padding:24px; }
+  .wrap { max-width:1100px; margin:auto; }
+  h1 { color:#f5c518; margin-bottom:4px; }
+  .sub { color:#9ea4b0; margin-bottom:24px; }
+  .grid { display:grid; grid-template-columns: 2fr 1fr; gap:20px; }
+  textarea, input, select { width:100%; box-sizing:border-box; background:#161922; color:#fff; border:1px solid #2a2f3d; border-radius:8px; padding:12px; font-size:15px; margin-top:6px; margin-bottom:14px; }
+  label { font-weight:bold; font-size:14px; color:#d1d5db; }
+  button { width:100%; background:#f5c518; color:#0c0d11; font-weight:800; font-size:16px; border:none; border-radius:8px; padding:14px; cursor:pointer; }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  .box { background:#141720; padding:18px; border-radius:12px; border:1px solid #232836; }
+  .status { margin-top:16px; padding:14px; background:#191d28; border-radius:8px; color:#f5c518; font-weight:bold; }
+  video { width:100%; border-radius:10px; margin-top:16px; background:#000; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎬 KINETIC ESSAY STUDIO</h1>
+  <div class="sub">محرك المقالات المرئية الحديثة (Kinetic Typography + Real Photographic Evidence + Cinematic SFX)</div>
+  <div class="grid">
+    <div class="box">
+      <label>السكريبت الإنجليزي (Full English Script)</label>
+      <textarea id="script" rows="16" placeholder="Paste your English documentary script here..."></textarea>
+    </div>
+    <div class="box">
+      <label>DeepSeek API Key</label>
+      <input type="password" id="api_key" placeholder="sk-...">
+      <label>الموديل (مثبت)</label>
+      <input type="text" value="DeepSeek-V4.1-Flash" disabled>
+      <label>صوت المعلق (Kokoro TTS)</label>
+      <select id="voice">
+        <option value="am_michael">am_michael (وثائقي عميق)</option>
+        <option value="am_adam">am_adam (حماسي واضح)</option>
+        <option value="bm_george">bm_george (بريطاني رصين)</option>
+        <option value="bm_lewis">bm_lewis (بريطاني تحليلي)</option>
+      </select>
+      <label>وضع الريندر</label>
+      <select id="mode">
+        <option value="preview">Preview Render (سريع - أول 25 ثانية 720p)</option>
+        <option value="full">Full Production Render (كامل 1080p)</option>
+      </select>
+      <label><input type="checkbox" id="sfx" checked style="width:auto;"> تفعيل المؤثرات الصوتية السينمائية</label>
+      <button id="btn" onclick="startJob()">🚀 إنتاج الفيديو الآن</button>
+    </div>
+  </div>
+  <div class="status" id="status">جاهز للتشغيل...</div>
+  <div id="player_wrap"></div>
+</div>
+<script>
+async function startJob() {
+  const btn = document.getElementById('btn');
+  const status = document.getElementById('status');
+  btn.disabled = true;
+  status.innerText = "جاري إرسال الطلب للسيرفر...";
+  const res = await fetch('/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      script: document.getElementById('script').value,
+      api_key: document.getElementById('api_key').value,
+      voice: document.getElementById('voice').value,
+      speed: 1.0,
+      mode: document.getElementById('mode').value,
+      enable_sfx: document.getElementById('sfx').checked
+    })
+  });
+  const data = await res.json();
+  if (data.error) { status.innerText = "❌ " + data.error; btn.disabled = false; return; }
+  poll(data.job_id);
+}
+async function poll(id) {
+  const res = await fetch('/status/' + id);
+  const d = await res.json();
+  document.getElementById('status').innerText = d.status;
+  if (d.done) {
+    document.getElementById('btn').disabled = false;
+    document.getElementById('player_wrap').innerHTML = `<video controls src="/video/${id}"></video><br><a href="/video/${id}" download style="color:#f5c518;font-weight:bold;">⬇️ تحميل الفيديو (MP4)</a>`;
+  } else if (d.error) {
+    document.getElementById('btn').disabled = false;
+  } else {
+    setTimeout(() => poll(id), 2500);
+  }
+}
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_UI)
+
+
+@app.route("/start", methods=["POST"])
+def start():
+    data = request.json or {}
+    if not (data.get("script") or "").strip():
+        return jsonify({"error": "يرجى إدخال السكريبت أولاً."})
+    if not (data.get("api_key") or "").strip():
+        return jsonify({"error": "يرجى إدخال مفتاح DeepSeek API Key."})
 
     job_id = uuid.uuid4().hex[:10]
-    job_dir = os.path.join("./workspace/jobs", job_id)
-    os.makedirs(job_dir, exist_ok=True)
-
-    progress(0.10, desc="1/4: تقطيع السكريبت وإخراج المشاهد (DeepSeek-V4.1-Flash)...")
-    director = KineticDirector(api_key=deepseek_api_key, model_id="DeepSeek-V4.1-Flash")
-    timeline = director.process_full_script(script_text, job_id=job_id)
-
-    progress(0.35, desc="2/4: توليد التعليق الصوتي والمؤثرات ومزامنة الكلمات...")
-    audio_engine = AudioAndSFXEngine(work_dir=job_dir, voice=voice_name, speed=speech_speed)
-    master_wav = audio_engine.generate_and_master(timeline, enable_sfx=enable_sfx)
-
-    progress(0.60, desc="3/4: جلب الصور الأرشيفية الحقيقية المطابقة...")
-    fetcher = KineticMediaFetcher(work_dir=job_dir)
-    timeline = fetcher.populate_timeline_media(timeline)
-
-    with open(os.path.join(job_dir, "timeline.json"), "w", encoding="utf-8") as f:
-        json.dump(timeline, f, indent=2, ensure_ascii=False)
-
-    is_preview = "Preview" in render_mode
-    width, height = (1280, 720) if is_preview else (1920, 1080)
-    preview_sec = 25.0 if is_preview else None
-
-    progress(0.75, desc="4/4: ريندر الفيديو النهائي...")
-    renderer = KineticRenderer(work_dir=job_dir, width=width, height=height, fps=30)
-    final_mp4 = os.path.join(job_dir, f"kinetic_essay_{job_id}.mp4")
-    renderer.build_movie(timeline, audio_wav=master_wav, out_mp4=final_mp4, preview_sec=preview_sec)
-
-    progress(1.0, desc="تم الإنتاج بنجاح!")
-    summary = f"تم إنتاج {len(timeline['scenes'])} مشهد بنجاح | المسار: {final_mp4}"
-    return final_mp4, summary
+    JOBS[job_id] = {"status": "بدء المعالجة...", "done": False, "error": None, "video_path": None}
+    threading.Thread(target=_run_job, args=(job_id, data), daemon=True).start()
+    return jsonify({"job_id": job_id})
 
 
-with gr.Blocks(theme=gr.themes.Base(primary_hue="amber", neutral_hue="slate"), title="KINETIC ESSAY STUDIO") as demo:
-    gr.Markdown("# 🎬 KINETIC ESSAY STUDIO\n**محرك إنتاج المقالات المرئية الحديثة (Kinetic Typography + Real Photographic Evidence + Cinematic SFX)**")
+@app.route("/status/<job_id>")
+def status(job_id):
+    return jsonify(JOBS.get(job_id, {"status": "غير موجود", "error": "Job not found"}))
 
-    with gr.Row():
-        with gr.Column(scale=2):
-            script_box = gr.Textbox(
-                label="السكريبت الإنجليزي (Full English Script)",
-                placeholder="Paste your documentary or video-essay script here...",
-                lines=14
-            )
-        with gr.Column(scale=1):
-            api_key_box = gr.Textbox(label="DeepSeek API Key", type="password", placeholder="sk-...")
-            model_display = gr.Textbox(label="الموديل المستخدم (مثبت)", value="DeepSeek-V4.1-Flash", interactive=False)
-            voice_dropdown = gr.Dropdown(
-                label="صوت المعلق (Kokoro TTS)",
-                choices=["am_michael", "am_adam", "bm_george", "bm_lewis", "af_bella"],
-                value="am_michael"
-            )
-            speed_slider = gr.Slider(label="سرعة الإلقاء", minimum=0.85, maximum=1.20, value=1.0, step=0.05)
-            mode_radio = gr.Radio(
-                label="وضع الريندر",
-                choices=["Preview Render (Fast 25s - 720p)", "Full Production Render (1080p)"],
-                value="Preview Render (Fast 25s - 720p)"
-            )
-            sfx_checkbox = gr.Checkbox(label="تفعيل المؤثرات الصوتية السينمائية والخلفية (SFX & Ambient)", value=True)
-            run_btn = gr.Button("🚀 إنتاج الفيديو الآن", variant="primary")
 
-    with gr.Row():
-        video_out = gr.Video(label="المعاينة والتحميل")
-        status_out = gr.Textbox(label="حالة الإنتاج ومسار الملف", interactive=False)
+@app.route("/video/<job_id>")
+def video(job_id):
+    job = JOBS.get(job_id)
+    if not job or not job.get("video_path"):
+        return "Not ready", 404
+    return send_file(job["video_path"], mimetype="video/mp4")
 
-    run_btn.click(
-        fn=generate_video_essay,
-        inputs=[script_box, api_key_box, voice_dropdown, speed_slider, mode_radio, sfx_checkbox],
-        outputs=[video_out, status_out]
-    )
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0", server_port=7860, share=True)
+    print("\n" + "=" * 55)
+    print("  OPEN YOUR RUNPOD HTTP SERVICE ON PORT 7860")
+    print("=" * 55 + "\n")
+    app.run(host="0.0.0.0", port=7860, threaded=True)
