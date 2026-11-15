@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 set -e
 
-apt-get update -y && apt-get install -y ffmpeg espeak-ng fonts-dejavu-core wget curl
-pip install --upgrade pip
-pip install flask requests pillow numpy soundfile kokoro>=0.3.4 whisperx transformers torch torchvision
+echo "=========================================="
+echo "  KINETIC ESSAY STUDIO - SETUP & LAUNCH"
+echo "=========================================="
+
+apt-get update -y && apt-get install -y ffmpeg espeak-ng fonts-dejavu-core fonts-liberation wget curl
+
+pip install "pip<25"
+pip install "pydantic==2.10.6" "gradio==4.44.0" "gradio_client==1.3.0" requests pillow numpy soundfile "kokoro>=0.3.4" whisperx transformers torch torchvision
 
 mkdir -p assets/fonts workspace
+
+wget -q -O assets/fonts/Inter-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/inter/Inter%5Bopsz%2Cwght%5D.ttf" || true
 wget -q -O assets/fonts/Inter-Bold.ttf "https://github.com/google/fonts/raw/main/ofl/inter/Inter%5Bopsz%2Cwght%5D.ttf" || true
 
 python3 app.py
