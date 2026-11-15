@@ -1,4 +1,9 @@
 import os
+import sys
+
+os.environ["USE_TORCHVISION"] = "0"
+sys.modules["torchvision"] = None
+
 import re
 import json
 import uuid
