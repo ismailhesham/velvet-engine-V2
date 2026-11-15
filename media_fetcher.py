@@ -12,12 +12,6 @@ logger = logging.getLogger("kinetic.media")
 
 
 class KineticMediaFetcher:
-    """
-    جالب الصور الأرشيفية والحقيقية (Wikimedia Commons + Wikipedia REST):
-    - يجلب صور فوتوغرافية حقيقية مطابقة لموضوع كل مشهد (FRAMED_IMAGE).
-    - يفلتر أيقونات SVG والصور الصغيرة أو التالفة لضمان جودة عرض سينمائية.
-    - يحول المشهد تلقائياً إلى KINETIC_TEXT إذا لم تتوفر صورة حقيقية مطابقة.
-    """
     def __init__(self, work_dir: str = "./workspace"):
         self.work_dir = work_dir
         self.cache_dir = os.path.join(work_dir, "media_cache")
