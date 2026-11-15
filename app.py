@@ -1,26 +1,142 @@
 import os
 import re
-import uuid
 import json
-import random
+import uuid
 import logging
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Tuple, Optional
 
 import numpy as np
 import soundfile as sf
 import gradio as gr
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont
 
 from director import KineticDirector
 from media_fetcher import KineticMediaFetcher
 
+
+class MaskSecretsFilter(logging.Filter):
+    """Prevents accidental API key leakage in application logs."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        for env_key in ("DIRECTOR_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY", "PIXABAY_API_KEY", "PEXELS_API_KEY"):
+            val = os.getenv(env_key, "")
+            if val and len(val) > 6 and val in msg:
+                record.msg = msg.replace(val, "***REDACTED***")
+                record.args = ()
+        return True
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("kinetic.app")
+logging.getLogger().addFilter(MaskSecretsFilter())
+logger = logging.getLogger("velvet.kinetic")
+
+VELVET_CUSTOM_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&family=Playfair+Display:ital,wght@0,600;0,700;1,600&display=swap');
+
+:root, .dark {
+    --body-background-fill: #070709 !important;
+    --background-fill-primary: #0e0e13 !important;
+    --background-fill-secondary: #14141b !important;
+    --border-color-primary: rgba(212, 175, 55, 0.22) !important;
+    --color-accent: #d4af37 !important;
+    --body-text-color: #f4f0e8 !important;
+    --block-title-text-color: #d4af37 !important;
+}
+
+body, .gradio-container {
+    background: radial-gradient(circle at top center, #14131a 0%, #070709 65%) !important;
+    font-family: 'Cairo', sans-serif !important;
+    color: #f4f0e8 !important;
+    max-width: 1360px !important;
+    margin: 0 auto !important;
+}
+
+.velvet-header {
+    text-align: center;
+    padding: 24px 20px 18px 20px;
+    margin-bottom: 18px;
+    background: linear-gradient(180deg, rgba(212,175,55,0.08) 0%, rgba(14,14,19,0.4) 100%);
+    border: 1px solid rgba(212, 175, 55, 0.28);
+    border-radius: 16px;
+}
+
+.velvet-badge {
+    display: inline-block;
+    padding: 4px 14px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    color: #d4af37;
+    border: 1px solid rgba(212, 175, 55, 0.45);
+    border-radius: 999px;
+    background: rgba(212, 175, 55, 0.08);
+    margin-bottom: 8px;
+}
+
+.velvet-title {
+    font-family: 'Playfair Display', serif !important;
+    font-size: 36px !important;
+    font-weight: 700 !important;
+    color: #f6f2eb !important;
+    margin: 0 !important;
+}
+
+.velvet-card {
+    background: rgba(16, 16, 22, 0.85) !important;
+    border: 1px solid rgba(255, 255, 255, 0.07) !important;
+    border-radius: 14px !important;
+    padding: 16px !important;
+}
+
+.script-stats-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: rgba(212, 175, 55, 0.06);
+    border: 1px solid rgba(212, 175, 55, 0.2);
+    border-radius: 10px;
+    padding: 10px 18px;
+    margin-top: 8px;
+    font-size: 13.5px;
+    color: #d8d2c7;
+}
+
+.script-stats-bar span b {
+    color: #d4af37;
+    font-size: 15px;
+}
+
+#produce-btn {
+    background: linear-gradient(135deg, #e5c158 0%, #b88e22 100%) !important;
+    color: #09090b !important;
+    font-weight: 800 !important;
+    font-size: 16px !important;
+    border: none !important;
+    border-radius: 12px !important;
+    padding: 14px 24px !important;
+    margin-top: 12px !important;
+    cursor: pointer !important;
+}
+"""
+
+
+def update_script_stats(text: str) -> str:
+    words = len(text.split()) if text and text.strip() else 0
+    est_minutes = round(words / 145.0, 1)
+    est_beats = max(1, round(words / 10.0)) if words > 0 else 0
+    return f"""
+    <div class="script-stats-bar">
+        <span>📝 الكلمات: <b>{words:,}</b> كلمة</span>
+        <span>⏱️ المدة المتوقعة: <b>~{est_minutes}</b> دقيقة</span>
+        <span>🎞️ المشاهد الحركية المقدرة: <b>~{est_beats}</b> مشهد</span>
+    </div>
+    """
 
 
 class AudioAndSFXEngine:
-    def __init__(self, work_dir: str, voice: str = "am_michael", speed: float = 1.0):
+    def __init__(self, work_dir: str, voice: str = "bm_george", speed: float = 1.0):
         self.work_dir = work_dir
         self.audio_dir = os.path.join(work_dir, "audio_segments")
         os.makedirs(self.audio_dir, exist_ok=True)
@@ -65,7 +181,7 @@ class AudioAndSFXEngine:
             compute_type = "float16" if device == "cuda" else "int8"
             model = whisperx.load_model("base.en", device, compute_type=compute_type)
             audio = whisperx.load_audio(wav_path)
-            result = model.transcribe(audio, batch_size=8)
+            result = model.transcribe(audio, batch_size=16)
             model_a, metadata = whisperx.load_align_model(language_code="en", device=device)
             aligned = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
 
@@ -88,7 +204,7 @@ class AudioAndSFXEngine:
             for s in scenes:
                 s["word_timestamps"] = []
 
-    def generate_and_master(self, timeline: Dict[str, Any], enable_sfx: bool = True) -> str:
+    def generate_and_master(self, timeline: Dict[str, Any], enable_music: bool = True, enable_sfx: bool = True) -> str:
         scenes = timeline.get("scenes") or []
         seg_arrays: List[np.ndarray] = []
         cursor = 0.0
@@ -106,6 +222,7 @@ class AudioAndSFXEngine:
             s["end_time"] = round(cursor, 3)
             s["duration"] = round(dur, 3)
 
+        timeline["audio_master"] = {"total_duration_sec": round(cursor, 2)}
         voice_only = np.concatenate(seg_arrays) if seg_arrays else np.zeros(self.sample_rate * 2, dtype=np.float32)
         voice_wav = os.path.join(self.work_dir, "voice_master.wav")
         sf.write(voice_wav, voice_only, self.sample_rate)
@@ -113,7 +230,7 @@ class AudioAndSFXEngine:
         self._align_whisperx(voice_wav, scenes)
 
         master_audio = voice_only.copy()
-        if enable_sfx and len(master_audio) > 0:
+        if enable_music and len(master_audio) > 0:
             t = np.arange(len(master_audio), dtype=np.float32) / float(self.sample_rate)
             drone = (
                 0.016 * np.sin(2 * np.pi * 55.0 * t)
@@ -122,6 +239,7 @@ class AudioAndSFXEngine:
             ).astype(np.float32)
             master_audio += drone
 
+        if enable_sfx and len(master_audio) > 0:
             rng = np.random.default_rng(42)
             for idx, s in enumerate(scenes):
                 start_idx = int(float(s.get("start_time", 0.0)) * self.sample_rate)
@@ -150,32 +268,37 @@ class AudioAndSFXEngine:
 
 
 class KineticRenderer:
-    def __init__(self, work_dir: str, width: int = 1920, height: int = 1080, fps: int = 30):
+    def __init__(
+        self,
+        work_dir: str,
+        width: int = 1920,
+        height: int = 1080,
+        fps: int = 30,
+        style_preset: str = "Investigative Essay",
+        enable_captions: bool = False,
+        enable_source_labels: bool = True
+    ):
         self.work_dir = work_dir
         self.renders_dir = os.path.join(work_dir, "scene_renders")
         os.makedirs(self.renders_dir, exist_ok=True)
         self.width = int(width)
         self.height = int(height)
         self.fps = int(fps)
+        self.enable_captions = enable_captions
+        self.enable_source_labels = enable_source_labels
 
+        palette_map = {
+            "Investigative Essay": (212, 175, 55),
+            "Archival Historical": (230, 140, 60),
+            "Natural Environment": (16, 185, 129),
+        }
+        self.accent = palette_map.get(style_preset, (212, 175, 55))
         self.bg_color = (12, 13, 17)
         self.cream = (248, 249, 250)
         self.dim_text = (75, 79, 88)
         self.muted = (158, 164, 176)
-        self.accent = (245, 197, 24)
 
-        random.seed(42)
-        self.particles = [
-            {
-                "x": random.uniform(0, self.width),
-                "y": random.uniform(0, self.height),
-                "vx": random.uniform(-6, 6),
-                "vy": random.uniform(-10, -3),
-                "r": random.uniform(1.0, 2.0),
-                "alpha": random.randint(15, 45)
-            }
-            for _ in range(30)
-        ]
+        self._font_cache: Dict[Tuple[int, bool], ImageFont.FreeTypeFont] = {}
         self._bg_cache: Optional[Image.Image] = None
         self.vcodec = self._detect_encoder()
 
@@ -190,6 +313,9 @@ class KineticRenderer:
             return "libx264"
 
     def _get_font(self, size: int, bold: bool = True) -> ImageFont.FreeTypeFont:
+        key = (size, bold)
+        if key in self._font_cache:
+            return self._font_cache[key]
         scaled = max(14, int(round(size * (self.height / 1080.0))))
         paths = [
             "./assets/fonts/Inter-Bold.ttf" if bold else "./assets/fonts/Inter-Regular.ttf",
@@ -198,10 +324,14 @@ class KineticRenderer:
         for p in paths:
             if os.path.exists(p):
                 try:
-                    return ImageFont.truetype(p, scaled)
+                    font = ImageFont.truetype(p, scaled)
+                    self._font_cache[key] = font
+                    return font
                 except Exception:
                     continue
-        return ImageFont.load_default()
+        font = ImageFont.load_default()
+        self._font_cache[key] = font
+        return font
 
     def _wrap_lines(self, text: str, font: ImageFont.FreeTypeFont, max_w: int, max_lines: int = 4) -> List[str]:
         words = (text or "").split()
@@ -223,43 +353,40 @@ class KineticRenderer:
     def _static_bg(self) -> Image.Image:
         if self._bg_cache is not None:
             return self._bg_cache.copy()
-        base = Image.new("RGBA", (self.width, self.height), (*self.bg_color, 255))
-        layer = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(layer)
-        cx, cy = self.width // 2, self.height // 2
-        max_r = int(self.height * 0.72)
-        for r in range(max_r, 40, -60):
-            alpha = int(22 * (1 - r / max_r))
-            draw.ellipse([cx - int(r * 1.55), cy - r, cx + int(r * 1.55), cy + r], fill=(34, 38, 48, alpha))
+        base = Image.new("RGB", (self.width, self.height), self.bg_color)
+        draw = ImageDraw.Draw(base)
         step = max(60, int(self.width * 0.045))
+        grid_col = (20, 22, 29)
         for gx in range(0, self.width, step):
-            draw.line([gx, 0, gx, self.height], fill=(255, 255, 255, 6), width=1)
+            draw.line([gx, 0, gx, self.height], fill=grid_col, width=1)
         for gy in range(0, self.height, step):
-            draw.line([0, gy, self.width, gy], fill=(255, 255, 255, 6), width=1)
-        self._bg_cache = Image.alpha_composite(base, layer)
+            draw.line([0, gy, self.width, gy], fill=grid_col, width=1)
+        self._bg_cache = base
         return self._bg_cache.copy()
 
-    def _draw_glow_text(self, canvas: Image.Image, pos: Tuple[int, int], text: str, font: ImageFont.FreeTypeFont, fill: Tuple[int, int, int], anchor: str = "mm"):
-        glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-        ImageDraw.Draw(glow).text(pos, text, font=font, fill=(0, 0, 0, 95), anchor=anchor)
-        glow = glow.filter(ImageFilter.GaussianBlur(radius=8))
-        canvas.alpha_composite(glow)
-        ImageDraw.Draw(canvas).text(pos, text, font=font, fill=(*fill, 255), anchor=anchor)
+    def _draw_glow_text(self, draw: ImageDraw.ImageDraw, pos: Tuple[int, int], text: str, font: ImageFont.FreeTypeFont, fill: Tuple[int, int, int], anchor: str = "mm"):
+        x, y = pos
+        draw.text((x + 3, y + 4), text, font=font, fill=(4, 5, 8), anchor=anchor)
+        draw.text((x, y), text, font=font, fill=fill, anchor=anchor)
 
-    def _render_frame(self, scene: Dict[str, Any], rel_t: float, duration: float) -> Image.Image:
+    def _get_lit_count(self, scene: Dict[str, Any], rel_t: float, duration: float) -> int:
         progress = min(1.0, max(0.0, rel_t / max(0.1, duration)))
         abs_time = float(scene.get("start_time", 0.0)) + rel_t
+        word_ts = scene.get("word_timestamps") or []
+        words = (str(scene.get("raw_text") or "")).split() or ["..."]
+        if word_ts:
+            lit = 0
+            for idx, w_info in enumerate(word_ts):
+                if abs_time >= float(w_info.get("start", 0.0)) - 0.04:
+                    lit = idx + 1
+            return lit
+        return max(1, int(len(words) * min(1.0, progress * 1.25)))
+
+    def _render_frame(self, scene: Dict[str, Any], rel_t: float, duration: float, lit_override: Optional[int] = None) -> Image.Image:
         t_type = scene.get("template_type", "KINETIC_TEXT")
         t_data = scene.get("template_data") or {}
 
         canvas = self._static_bg()
-        overlay = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
-        o_draw = ImageDraw.Draw(overlay)
-        for p in self.particles:
-            px = (p["x"] + p["vx"] * abs_time) % self.width
-            py = (p["y"] + p["vy"] * abs_time) % self.height
-            o_draw.ellipse([px - p["r"], py - p["r"], px + p["r"], py + p["r"]], fill=(248, 249, 250, p["alpha"]))
-        canvas = Image.alpha_composite(canvas, overlay)
         draw = ImageDraw.Draw(canvas)
         cx, cy = self.width // 2, self.height // 2
         safe_w = int(self.width * 0.82)
@@ -282,31 +409,30 @@ class KineticRenderer:
             f_lbl = self._get_font(26, bold=True)
             f_desc = self._get_font(25, bold=False)
 
-            self._draw_glow_text(canvas, (cx, cy - int(self.height * 0.06)), num_str, f_num, self.accent)
+            self._draw_glow_text(draw, (cx, cy - int(self.height * 0.06)), num_str, f_num, self.accent)
             bar_w = int(110 * c_eased)
-            draw.rectangle([cx - bar_w, cy + int(self.height * 0.05), cx + bar_w, cy + int(self.height * 0.055)], fill=(*self.accent, 255))
-            draw.text((cx, cy + int(self.height * 0.10)), label, fill=(*self.cream, 255), font=f_lbl, anchor="mm")
+            draw.rectangle([cx - bar_w, cy + int(self.height * 0.05), cx + bar_w, cy + int(self.height * 0.055)], fill=self.accent)
+            draw.text((cx, cy + int(self.height * 0.10)), label, fill=self.cream, font=f_lbl, anchor="mm")
             for i, line in enumerate(self._wrap_lines(str(scene.get("raw_text") or ""), f_desc, safe_w, 2)):
-                draw.text((cx, cy + int(self.height * 0.16) + i * 36), line, fill=(*self.muted, 240), font=f_desc, anchor="mm")
+                draw.text((cx, cy + int(self.height * 0.16) + i * 36), line, fill=self.muted, font=f_desc, anchor="mm")
 
         elif t_type == "DOCUMENT_CARD":
             hdr = str(t_data.get("document_header") or "EVIDENCE // RECORD").upper()
             body = str(t_data.get("document_body") or scene.get("raw_text") or "")
             hl = str(t_data.get("highlight_phrase") or "").lower()
 
-            scale = 1.0 + 0.045 * progress
-            cw, ch = int(self.width * 0.66 * scale), int(self.height * 0.54 * scale)
+            cw, ch = int(self.width * 0.68), int(self.height * 0.54)
             x0, y0 = cx - cw // 2, cy - ch // 2
             x1, y1 = x0 + cw, y0 + ch
 
-            draw.rectangle([x0 + 16, y0 + 18, x1 + 16, y1 + 18], fill=(0, 0, 0, 195))
-            draw.rectangle([x0, y0, x1, y1], fill=(244, 241, 234, 255))
-            draw.rectangle([x0, y0, x1, y0 + 54], fill=(22, 25, 33, 255))
-            draw.rectangle([x0, y0, x0 + 8, y1], fill=(*self.accent, 255))
+            draw.rectangle([x0 + 14, y0 + 16, x1 + 14, y1 + 16], fill=(5, 6, 8))
+            draw.rectangle([x0, y0, x1, y1], fill=(244, 241, 234))
+            draw.rectangle([x0, y0, x1, y0 + 54], fill=(22, 25, 33))
+            draw.rectangle([x0, y0, x0 + 8, y1], fill=self.accent)
 
             f_hdr = self._get_font(19, bold=True)
             f_body = self._get_font(32, bold=True)
-            draw.text((x0 + 30, y0 + 27), hdr[:58], fill=(*self.accent, 255), font=f_hdr, anchor="lm")
+            draw.text((x0 + 30, y0 + 27), hdr[:58], fill=self.accent, font=f_hdr, anchor="lm")
 
             lines = self._wrap_lines(body, f_body, cw - 84, 5)
             hl_prog = min(1.0, max(0.0, (rel_t - 0.15) / 0.55))
@@ -316,25 +442,18 @@ class KineticRenderer:
                 if is_hl and hl_prog > 0.05:
                     bbox = draw.textbbox((x0 + 40, ly), line, font=f_body)
                     bw = int((bbox[2] - bbox[0] + 14) * hl_prog)
-                    draw.rectangle([x0 + 34, ly - 4, x0 + 34 + bw, bbox[3] + 8], fill=(*self.accent, 210))
-                draw.text((x0 + 40, ly), line, fill=(18, 20, 26, 255), font=f_body)
+                    draw.rectangle([x0 + 34, ly - 4, x0 + 34 + bw, bbox[3] + 8], fill=self.accent)
+                draw.text((x0 + 40, ly), line, fill=(18, 20, 26), font=f_body)
 
         else:
             raw_text = str(scene.get("raw_text") or "")
-            word_ts = scene.get("word_timestamps") or []
             words = raw_text.split() or ["..."]
             hl_raw = t_data.get("highlight_words") or []
             if isinstance(hl_raw, str):
                 hl_raw = hl_raw.split()
             hl_tokens = {re.sub(r"[^a-z0-9]", "", w.lower()) for w in hl_raw if len(w) > 2}
 
-            lit_count = 0
-            if word_ts:
-                for idx, w_info in enumerate(word_ts):
-                    if abs_time >= float(w_info.get("start", 0.0)) - 0.04:
-                        lit_count = idx + 1
-            else:
-                lit_count = max(1, int(len(words) * min(1.0, progress * 1.25)))
+            lit_count = lit_override if lit_override is not None else self._get_lit_count(scene, rel_t, duration)
 
             kicker = str(t_data.get("kicker") or "").upper().strip()
             f_size = 56 if len(words) <= 10 else (46 if len(words) <= 18 else 38)
@@ -346,8 +465,8 @@ class KineticRenderer:
             spacing = int((f_size + 26) * (self.height / 1080.0))
             start_y = cy - ((len(lines) - 1) * spacing) // 2
 
-            if kicker:
-                draw.text((cx, start_y - int(65 * (self.height / 1080.0))), kicker[:44], fill=(*self.accent, 235), font=f_kick, anchor="mm")
+            if kicker and self.enable_source_labels:
+                draw.text((cx, start_y - int(65 * (self.height / 1080.0))), kicker[:44], fill=self.accent, font=f_kick, anchor="mm")
 
             g_idx = 0
             for l_idx, l_words in enumerate(lines):
@@ -361,44 +480,52 @@ class KineticRenderer:
                     ww = draw.textbbox((0, 0), w + " ", font=f_word)[2]
                     if spoken:
                         col = self.accent if is_key else self.cream
-                        self._draw_glow_text(canvas, (curr_x, ly), w, f_word, col, anchor="lm")
+                        self._draw_glow_text(draw, (curr_x, ly), w, f_word, col, anchor="lm")
                     else:
-                        draw.text((curr_x, ly), w, fill=(*self.dim_text, 190), font=f_word, anchor="lm")
+                        draw.text((curr_x, ly), w, fill=self.dim_text, font=f_word, anchor="lm")
                     curr_x += ww
                     g_idx += 1
 
-        return canvas.convert("RGB")
+        if self.enable_captions and t_type != "KINETIC_TEXT":
+            sub_font = self._get_font(22, bold=True)
+            sub_txt = str(scene.get("raw_text") or "")[:95]
+            draw.text((cx, int(self.height * 0.92)), sub_txt, fill=self.cream, font=sub_font, anchor="mm")
+
+        return canvas
 
     def _encode_flags(self) -> List[str]:
-        preset = "fast" if self.vcodec == "h264_nvenc" else "ultrafast"
-        return ["-c:v", self.vcodec, "-preset", preset, "-profile:v", "main", "-pix_fmt", "yuv420p", "-r", str(self.fps), "-an"]
+        preset = "p1" if self.vcodec == "h264_nvenc" else "ultrafast"
+        return ["-c:v", self.vcodec, "-preset", preset, "-pix_fmt", "yuv420p", "-r", str(self.fps), "-an"]
 
     def render_scene(self, scene: Dict[str, Any]) -> str:
         sid = int(scene["scene_id"])
         dur = max(1.2, float(scene.get("duration", 3.0)))
+        t_type = scene.get("template_type", "KINETIC_TEXT")
         t_data = scene.get("template_data") or {}
         media_path = scene.get("local_media_path")
         out_clip = os.path.join(self.renders_dir, f"clip_{sid:04d}.mp4")
 
         if media_path and os.path.exists(media_path):
             try:
-                bg = self._static_bg().convert("RGB")
+                bg = self._static_bg()
                 fg = Image.open(media_path).convert("RGB")
                 fg.thumbnail((int(self.width * 0.66), int(self.height * 0.62)), Image.Resampling.LANCZOS)
 
-                pad, cap_h = 10, 52
+                pad = 10
+                cap_h = 52 if self.enable_source_labels else 10
                 fw, fh = fg.width + pad * 2, fg.height + pad * 2 + cap_h
                 frame_img = Image.new("RGB", (fw, fh), (20, 23, 30))
                 df = ImageDraw.Draw(frame_img)
                 df.rectangle([0, 0, fw - 1, fh - 1], outline=self.accent, width=2)
                 frame_img.paste(fg, (pad, pad))
 
-                cap_txt = str(t_data.get("caption") or scene.get("visual_goal") or "VISUAL EVIDENCE").upper()[:46]
-                df.text((fw // 2, fg.height + pad + cap_h // 2), cap_txt, fill=self.accent, font=self._get_font(20, True), anchor="mm")
+                if self.enable_source_labels:
+                    cap_txt = str(t_data.get("caption") or scene.get("visual_goal") or "VISUAL EVIDENCE").upper()[:46]
+                    df.text((fw // 2, fg.height + pad + cap_h // 2), cap_txt, fill=self.accent, font=self._get_font(20, True), anchor="mm")
 
                 bg.paste(frame_img, ((self.width - fw) // 2, (self.height - fh) // 2))
                 framed_jpg = os.path.join(self.renders_dir, f"framed_{sid:04d}.jpg")
-                bg.save(framed_jpg, quality=94)
+                bg.save(framed_jpg, quality=92)
 
                 frames = max(1, int(dur * self.fps))
                 up_w = int(self.width * 1.12)
@@ -411,122 +538,324 @@ class KineticRenderer:
         frames = max(1, int(dur * self.fps))
         cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{self.width}x{self.height}", "-pix_fmt", "rgb24", "-r", str(self.fps), "-i", "-"] + self._encode_flags() + [out_clip]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        state_cache: Dict[int, bytes] = {}
         for f_idx in range(frames):
-            img = self._render_frame(scene, rel_t=f_idx / float(self.fps), duration=dur)
-            proc.stdin.write(img.tobytes())
+            rel_t = f_idx / float(self.fps)
+            if t_type == "KINETIC_TEXT":
+                lit = self._get_lit_count(scene, rel_t, dur)
+                if lit not in state_cache:
+                    state_cache[lit] = self._render_frame(scene, rel_t=rel_t, duration=dur, lit_override=lit).tobytes()
+                proc.stdin.write(state_cache[lit])
+            else:
+                step_key = int(f_idx // 2)
+                if step_key not in state_cache:
+                    state_cache[step_key] = self._render_frame(scene, rel_t=rel_t, duration=dur).tobytes()
+                proc.stdin.write(state_cache[step_key])
+
         proc.stdin.close()
         proc.wait()
         return out_clip
 
-    def build_movie(self, timeline: Dict[str, Any], audio_wav: str, out_mp4: str, preview_sec: Optional[float] = None) -> str:
-        scenes = timeline.get("scenes") or []
-        if preview_sec and preview_sec > 0:
-            sub, acc = [], 0.0
-            for s in scenes:
-                sub.append(s)
-                acc += float(s.get("duration") or 3.0)
-                if acc >= preview_sec:
-                    break
-            scenes = sub
 
-        clips = []
-        for idx, s in enumerate(scenes, start=1):
-            logger.info("Rendering scene %d/%d (%s)...", idx, len(scenes), s.get("template_type"))
-            clips.append(self.render_scene(s))
-
-        concat_txt = os.path.join(self.work_dir, "concat.txt")
-        with open(concat_txt, "w", encoding="utf-8") as f:
-            for c in clips:
-                f.write(f"file '{os.path.abspath(c)}'\n")
-
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt, "-i", audio_wav, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", out_mp4],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        return out_mp4
-
-
-def generate_video_essay(
+def run_velvet_pipeline(
     script_text: str,
-    deepseek_api_key: str,
+    provider: str,
+    model_id: str,
+    llm_api_key: str,
+    pexels_key: str,
+    pixabay_key: str,
     voice_name: str,
-    speech_speed: float,
     render_mode: str,
-    enable_sfx: bool
+    style_preset: str,
+    resolution_choice: str,
+    fps_choice: int,
+    preview_duration_sec: int,
+    enable_captions: bool,
+    enable_source_labels: bool,
+    enable_music: bool,
+    enable_ambience_sfx: bool,
+    media_providers: list,
+    progress=gr.Progress()
 ):
-    if not (script_text or "").strip():
-        raise gr.Error("يرجى إدخال السكريبت الإنجليزي أولاً.")
-    if not (deepseek_api_key or "").strip():
-        raise gr.Error("يرجى إدخال مفتاح DeepSeek API Key.")
+    if not script_text or not script_text.strip():
+        raise gr.Error("من فضلك الصق السكريبت الإنجليزي أولاً في مساحة العمل!")
 
-    job_id = uuid.uuid4().hex[:10]
-    job_dir = os.path.join("./workspace/jobs", job_id)
+    effective_llm_key = (llm_api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DIRECTOR_API_KEY") or "").strip()
+    if not effective_llm_key:
+        raise gr.Error("مفتاح API للمخرج مطلوب! أدخل مفتاح DeepSeek في إعدادات الـ API.")
+
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = os.path.join("./workspace", "jobs", job_id)
     os.makedirs(job_dir, exist_ok=True)
+    log_path = os.path.join(job_dir, "render_log.txt")
+    thumbs_dir = os.path.join(job_dir, "live_thumbs")
+    os.makedirs(thumbs_dir, exist_ok=True)
 
-    logger.info("[1/4] Segmenting script with DeepSeek-V4.1-Flash...")
-    director = KineticDirector(api_key=deepseek_api_key, model_id="DeepSeek-V4.1-Flash")
+    def write_log(line: str):
+        with open(log_path, "a", encoding="utf-8") as lf:
+            lf.write(line + "\n")
+
+    write_log(f"[JOB {job_id}] Started | provider={provider} | model={model_id} | mode={render_mode} | style={style_preset}")
+
+    res_map = {
+        "1080p Full HD (1920x1080)": (1920, 1080),
+        "720p HD Fast (1280x720)": (1280, 720),
+        "480p Quick Draft (854x480)": (854, 480),
+    }
+    is_preview = (render_mode == "Preview Render (Fast Draft)")
+    width, height = (1280, 720) if is_preview else res_map.get(resolution_choice, (1920, 1080))
+    fps = 24 if is_preview else int(fps_choice or 30)
+
+    # 1. تقسيم المشاهد
+    progress(0.08, desc="1/4 🧠 تحليل السكريبت وتقسيم المشاهد الحركية...")
+    yield None, None, None, None, None, "🧠 **جاري تحليل السكريبت وتقسيم المشاهد...**", []
+
+    director = KineticDirector(api_key=effective_llm_key, model_id=(model_id or "DeepSeek-V4.1-Flash").strip())
     timeline = director.process_full_script(script_text, job_id=job_id)
+    scenes_all = timeline.get("scenes", [])
+    write_log(f"[STAGE 1] Planned {len(scenes_all)} scenes.")
 
-    logger.info("[2/4] Generating Kokoro TTS & WhisperX word timestamps...")
-    audio_engine = AudioAndSFXEngine(work_dir=job_dir, voice=voice_name, speed=speech_speed)
-    master_wav = audio_engine.generate_and_master(timeline, enable_sfx=enable_sfx)
+    # 2. الصوت والمزامنة
+    progress(0.25, desc=f"2/4 🎙️ توليد التعليق الصوتي لـ {len(scenes_all)} مشهد...")
+    yield None, None, None, None, None, f"🎙️ **تم تخطيط {len(scenes_all)} مشهد — جاري توليد الصوت ومزامنة الكلمات...**", []
 
-    logger.info("[3/4] Fetching real Wikimedia photos...")
+    audio_eng = AudioAndSFXEngine(work_dir=job_dir, voice=voice_name)
+    mastered_wav = audio_eng.generate_and_master(timeline, enable_music=enable_music, enable_sfx=enable_ambience_sfx)
+    write_log(f"[STAGE 2] Audio mastered ({timeline.get('audio_master', {}).get('total_duration_sec')}s).")
+
+    # 3. جلب الصور الحقيقية
+    progress(0.45, desc="3/4 🎥 جلب الصور الأرشيفية الحقيقية المطابقة للمشاهد...")
+    yield None, None, None, None, None, "🎥 **جاري سحب الصور الأرشيفية الحقيقية من Wikimedia...**", []
+
     fetcher = KineticMediaFetcher(work_dir=job_dir)
     timeline = fetcher.populate_timeline_media(timeline)
 
-    with open(os.path.join(job_dir, "timeline.json"), "w", encoding="utf-8") as f:
+    media_manifest = [
+        {"scene_id": s["scene_id"], "template_type": s.get("template_type"), "local_media_path": s.get("local_media_path")}
+        for s in scenes_all if s.get("local_media_path")
+    ]
+    timeline_path = os.path.join(job_dir, "master_timeline.json")
+    media_manifest_path = os.path.join(job_dir, "media_manifest.json")
+    source_manifest_path = os.path.join(job_dir, "source_manifest.json")
+
+    with open(timeline_path, "w", encoding="utf-8") as f:
         json.dump(timeline, f, indent=2, ensure_ascii=False)
+    with open(media_manifest_path, "w", encoding="utf-8") as f:
+        json.dump(media_manifest, f, indent=2, ensure_ascii=False)
+    with open(source_manifest_path, "w", encoding="utf-8") as f:
+        json.dump({"job_id": job_id, "total_scenes": len(scenes_all), "evidence_scenes": media_manifest}, f, indent=2, ensure_ascii=False)
 
-    is_preview = "Preview" in render_mode
-    width, height = (1280, 720) if is_preview else (1920, 1080)
-    preview_sec = 25.0 if is_preview else None
+    # 4. الريندر الحي مشهد بمشهد مع عرض الصور مباشرة في الواجهة
+    renderer = KineticRenderer(
+        work_dir=job_dir,
+        width=width,
+        height=height,
+        fps=fps,
+        style_preset=style_preset,
+        enable_captions=enable_captions,
+        enable_source_labels=enable_source_labels
+    )
 
-    logger.info("[4/4] Rendering final video...")
-    renderer = KineticRenderer(work_dir=job_dir, width=width, height=height, fps=30)
-    final_mp4 = os.path.join(job_dir, f"kinetic_essay_{job_id}.mp4")
-    renderer.build_movie(timeline, audio_wav=master_wav, out_mp4=final_mp4, preview_sec=preview_sec)
+    max_prev = float(preview_duration_sec) if is_preview else None
+    scenes_to_render = scenes_all
+    if max_prev and max_prev > 0:
+        sub, acc = [], 0.0
+        for s in scenes_all:
+            sub.append(s)
+            acc += float(s.get("duration") or 3.0)
+            if acc >= max_prev:
+                break
+        scenes_to_render = sub
 
-    summary = f"تم إنتاج {len(timeline['scenes'])} مشهد بنجاح | المسار: {final_mp4}"
-    return final_mp4, summary
+    total_s = len(scenes_to_render)
+    live_gallery = []
+    clips_dict = {}
+
+    def render_with_preview(scene_obj: Dict[str, Any]):
+        sid = int(scene_obj["scene_id"])
+        dur = max(1.2, float(scene_obj.get("duration", 3.0)))
+        thumb_path = os.path.join(thumbs_dir, f"thumb_{sid:04d}.jpg")
+        if scene_obj.get("local_media_path") and os.path.exists(scene_obj["local_media_path"]):
+            preview_img = Image.open(scene_obj["local_media_path"]).convert("RGB")
+        else:
+            preview_img = renderer._render_frame(scene_obj, rel_t=dur * 0.65, duration=dur)
+        preview_img.thumbnail((640, 360))
+        preview_img.save(thumb_path, quality=85)
+
+        clip_path = renderer.render_scene(scene_obj)
+        caption = f"#{sid} [{scene_obj.get('template_type')}] {str(scene_obj.get('raw_text', ''))[:45]}..."
+        return sid, clip_path, (thumb_path, caption)
+
+    completed_count = 0
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(render_with_preview, s): s for s in scenes_to_render}
+        for fut in as_completed(futures):
+            sid, clip_path, gallery_item = fut.result()
+            clips_dict[sid] = clip_path
+            live_gallery.append(gallery_item)
+            live_gallery.sort(key=lambda x: int(x[1].split()[0].lstrip("#")))
+            completed_count += 1
+
+            pct = 0.50 + 0.45 * (completed_count / max(1, total_s))
+            progress(pct, desc=f"4/4 🎬 جاري الريندر الحي: اكتمل {completed_count} من {total_s} مشهد...")
+            status_live = f"⏳ **جاري الريندر الحي:** اكتمل `{completed_count} / {total_s}` مشهد (تظهر المشاهد بالأسفل فور انتهائها)"
+            yield None, timeline_path, media_manifest_path, source_manifest_path, log_path, status_live, list(live_gallery)
+
+    # تجميع الفيديو النهائي
+    ordered_clips = [clips_dict[int(s["scene_id"])] for s in scenes_to_render]
+    concat_txt = os.path.join(job_dir, "concat.txt")
+    with open(concat_txt, "w", encoding="utf-8") as f:
+        for c in ordered_clips:
+            f.write(f"file '{os.path.abspath(c)}'\n")
+
+    out_filename = "velvet_preview.mp4" if is_preview else "velvet_documentary.mp4"
+    final_mp4 = os.path.join(job_dir, out_filename)
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt, "-i", mastered_wav, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", final_mp4],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    write_log(f"[STAGE 4] Export complete: {final_mp4}")
+    progress(1.0, desc=f"✨ اكتمل الإنتاج بنجاح (Job ID: {job_id})")
+    status_md = f"**✅ Job ID:** `{job_id}` | **Resolution:** `{width}x{height} @ {fps}fps` | **Scenes:** `{total_s}`"
+    yield final_mp4, timeline_path, media_manifest_path, source_manifest_path, log_path, status_md, list(live_gallery)
 
 
-with gr.Blocks(title="KINETIC ESSAY STUDIO") as demo:
-    gr.Markdown("# 🎬 KINETIC ESSAY STUDIO\n**محرك إنتاج المقالات المرئية الحديثة (Kinetic Typography + Real Photographic Evidence + Cinematic SFX)**")
+velvet_theme = gr.themes.Base(
+    primary_hue="amber",
+    secondary_hue="stone",
+    neutral_hue="zinc",
+).set(
+    body_background_fill="#070709",
+    block_background_fill="#101016",
+    block_border_width="1px",
+    block_border_color="rgba(212, 175, 55, 0.2)",
+)
 
-    with gr.Row():
-        with gr.Column(scale=2):
-            script_box = gr.Textbox(
-                label="السكريبت الإنجليزي (Full English Script)",
-                placeholder="Paste your documentary or video-essay script here...",
-                lines=14
+with gr.Blocks(theme=velvet_theme, css=VELVET_CUSTOM_CSS, title="VELVET STUDIO // Kinetic Essay Engine v4.0") as demo:
+    gr.HTML("""
+        <div class="velvet-header">
+            <div class="velvet-badge">VELVET KINETIC ENGINE v4.0 • LIVE SCENE MONITOR</div>
+            <h1 class="velvet-title">VELVET DOCUMENTARY STUDIO</h1>
+            <p style="color:#9e988e; font-size:14px; margin-top:4px;">محرك إنتاج المقالات المرئية والأفلام الوثائقية — نصوص حركية متزامنة، صور أرشيفية حقيقية، ومعاينة حية للمشاهد أثناء الريندر</p>
+        </div>
+    """)
+
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=7, elem_classes="velvet-card"):
+            gr.Markdown("### ✍️ مساحة السكريبت الوثائقي (Script Workspace)")
+            script_input = gr.Textbox(
+                lines=15,
+                placeholder="Paste your continuous English documentary script here...",
+                show_label=False
             )
-        with gr.Column(scale=1):
-            api_key_box = gr.Textbox(label="DeepSeek API Key", type="password", placeholder="sk-...")
-            model_display = gr.Textbox(label="الموديل المستخدم (مثبت)", value="DeepSeek-V4.1-Flash", interactive=False)
-            voice_dropdown = gr.Dropdown(
-                label="صوت المعلق (Kokoro TTS)",
-                choices=["am_michael", "am_adam", "bm_george", "bm_lewis", "af_bella"],
-                value="am_michael"
-            )
-            speed_slider = gr.Slider(label="سرعة الإلقاء", minimum=0.85, maximum=1.20, value=1.0, step=0.05)
-            mode_radio = gr.Radio(
-                label="وضع الريندر",
-                choices=["Preview Render (Fast 25s - 720p)", "Full Production Render (1080p)"],
-                value="Preview Render (Fast 25s - 720p)"
-            )
-            sfx_checkbox = gr.Checkbox(label="تفعيل المؤثرات الصوتية السينمائية والخلفية (SFX & Ambient)", value=True)
-            run_btn = gr.Button("🚀 إنتاج الفيديو الآن", variant="primary")
+            stats_display = gr.HTML(update_script_stats(""))
+            script_input.change(fn=update_script_stats, inputs=script_input, outputs=stats_display)
 
-    with gr.Row():
-        video_out = gr.Video(label="المعاينة والتحميل")
-        status_out = gr.Textbox(label="حالة الإنتاج ومسار الملف", interactive=False)
+            with gr.Row():
+                render_mode = gr.Radio(
+                    choices=["Final Render (Full Quality)", "Preview Render (Fast Draft)"],
+                    value="Preview Render (Fast Draft)",
+                    label="وضع الريندر"
+                )
+                preview_duration_sec = gr.Slider(minimum=15, maximum=90, value=25, step=5, label="مدة المعاينة السريعة (ثانية)")
+
+            run_btn = gr.Button("🎬 بدء إنتاج الفيلم الوثائقي (Produce Kinetic Documentary)", elem_id="produce-btn")
+
+        with gr.Column(scale=4, elem_classes="velvet-card"):
+            gr.Markdown("### 🎛️ إعدادات الصوت والإخراج")
+            voice_name = gr.Radio(
+                choices=[
+                    ("🇬🇧 البريطاني الفخم (George)", "bm_george"),
+                    ("🇺🇸 الأمريكي العميق (Michael)", "am_michael"),
+                    ("🇬🇧 البريطاني الروائي (Daniel)", "bm_daniel"),
+                    ("🇺🇸 الأمريكي الحماسي (Adam)", "am_adam"),
+                    ("🇬🇧 البريطاني التحليلي (Lewis)", "bm_lewis")
+                ],
+                value="bm_george",
+                label="نبرة المعلق الصوتي"
+            )
+
+            with gr.Accordion("🎨 إعدادات الصورة والصوت والمصادر", open=False):
+                style_preset = gr.Dropdown(
+                    choices=["Investigative Essay", "Archival Historical", "Natural Environment"],
+                    value="Investigative Essay",
+                    label="النمط اللوني والبصري (Visual Style Preset)"
+                )
+                resolution_choice = gr.Dropdown(
+                    choices=["1080p Full HD (1920x1080)", "720p HD Fast (1280x720)", "480p Quick Draft (854x480)"],
+                    value="1080p Full HD (1920x1080)",
+                    label="دقة الفيديو"
+                )
+                fps_choice = gr.Dropdown(choices=[24, 30], value=30, label="معدل الإطارات (FPS)")
+                media_providers = gr.CheckboxGroup(
+                    choices=["wikimedia", "wikipedia"],
+                    value=["wikimedia", "wikipedia"],
+                    label="مصادر الصور الحقيقية المفعلة"
+                )
+                enable_captions = gr.Checkbox(value=False, label="تفعيل الترجمة السفلية الإضافية (Subtitles)")
+                enable_source_labels = gr.Checkbox(value=True, label="إظهار شارات المصادر والعناوين (Source Labels)")
+                enable_music = gr.Checkbox(value=True, label="تفعيل الخلفية الموسيقية الداكنة (Dark Ambient Drone)")
+                enable_ambience_sfx = gr.Checkbox(value=True, label="تفعيل المؤثرات الصوتية السينمائية (Boom & Whoosh SFX)")
+
+            with gr.Accordion("🔑 مفاتيح الذكاء الاصطناعي والـ API", open=True):
+                provider = gr.Dropdown(
+                    choices=[("DeepSeek AI (Exclusive)", "deepseek")],
+                    value="deepseek",
+                    label="مزود الذكاء الاصطناعي للمخرج"
+                )
+                model_id = gr.Textbox(value="DeepSeek-V4.1-Flash", label="اسم الموديل (مثبت)")
+                llm_api_key = gr.Textbox(
+                    type="password",
+                    value=os.getenv("DEEPSEEK_API_KEY", ""),
+                    placeholder="sk-...",
+                    label="مفتاح DeepSeek API Key"
+                )
+                pixabay_key = gr.Textbox(
+                    type="password",
+                    value=os.getenv("PIXABAY_API_KEY", ""),
+                    placeholder="اختياري...",
+                    label="مفتاح Pixabay API (اختياري)"
+                )
+                pexels_key = gr.Textbox(
+                    type="password",
+                    value=os.getenv("PEXELS_API_KEY", ""),
+                    placeholder="اختياري...",
+                    label="مفتاح Pexels API (اختياري)"
+                )
+
+    with gr.Row(elem_classes="velvet-card"):
+        with gr.Column(scale=7):
+            gr.Markdown("### 📽️ شاشة العرض النهائية والمعاينة الحية للمشاهد")
+            job_status_md = gr.Markdown("**الحالة:** جاهز لبدء مشروع جديد")
+            live_gallery_out = gr.Gallery(
+                label="🎞️ المشاهد التي تم رندرتها (تظهر لحظة بلحظة أثناء الريندر)",
+                columns=3,
+                height=280
+            )
+            video_out = gr.Video(label="الفيديو الوثائقي الجاهز", height=440)
+        with gr.Column(scale=4):
+            gr.Markdown("### 📂 ملفات المشروع والتوثيق")
+            json_out = gr.File(label="master_timeline.json")
+            media_manifest_out = gr.File(label="media_manifest.json")
+            source_manifest_out = gr.File(label="source_manifest.json")
+            log_out = gr.File(label="render_log.txt")
 
     run_btn.click(
-        fn=generate_video_essay,
-        inputs=[script_box, api_key_box, voice_dropdown, speed_slider, mode_radio, sfx_checkbox],
-        outputs=[video_out, status_out]
+        fn=run_velvet_pipeline,
+        inputs=[
+            script_input, provider, model_id, llm_api_key, pexels_key, pixabay_key, voice_name,
+            render_mode, style_preset, resolution_choice, fps_choice, preview_duration_sec,
+            enable_captions, enable_source_labels, enable_music, enable_ambience_sfx, media_providers
+        ],
+        outputs=[video_out, json_out, media_manifest_out, source_manifest_out, log_out, job_status_md, live_gallery_out]
     )
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0", server_port=7860, share=True)
+    ui_auth = None
+    raw_auth = os.getenv("VELVET_UI_AUTH", "").strip()
+    if ":" in raw_auth:
+        u, p = raw_auth.split(":", 1)
+        ui_auth = (u, p)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=True, auth=ui_auth)
