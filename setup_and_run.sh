@@ -7,8 +7,7 @@ echo "=========================================="
 
 apt-get update -y && apt-get install -y ffmpeg espeak-ng fonts-dejavu-core fonts-liberation wget curl
 
-pip install "pip<25"
-pip install "pydantic==2.10.6" "gradio==4.44.0" "gradio_client==1.3.0" requests pillow numpy soundfile "kokoro>=0.3.4" whisperx transformers torch torchvision
+pip install --upgrade gradio requests pillow numpy soundfile "kokoro>=0.3.4" whisperx transformers torch torchvision
 
 mkdir -p assets/fonts workspace
 
